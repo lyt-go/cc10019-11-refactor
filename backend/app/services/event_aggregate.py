@@ -1,4 +1,8 @@
-"""事件聚合引擎：消费清洗后的事件数据，执行聚合计算。"""
+"""事件聚合引擎：消费清洗后的事件数据，执行聚合计算。
+
+聚合时读取对应事件的清洗回执并随产物归档，形成可回放的聚合批次；
+聚合口径（维度分组、时间粒度、聚合函数）保持不变。
+"""
 from __future__ import annotations
 
 from typing import Any
@@ -6,24 +10,8 @@ from collections import defaultdict
 
 from app.store import store
 from app.schemas import AggResult
-
-
-def _generate_cleaned_events(event_id: str, count: int) -> list[dict[str, Any]]:
-    """生成模拟清洗后的事件数据。"""
-    events = []
-    base_time = 1700000000
-    for i in range(1, count + 1):
-        user_id = f"U{i:05d}"
-        events.append({
-            "user_id": user_id,
-            "event_id": event_id,
-            "timestamp": base_time + (i % 24) * 3600 + (i // 24) * 86400,
-            "ATTR-001": ["app", "web", "miniapp", "h5"][i % 4],
-            "ATTR-004": ["ios", "android", "pc", "other"][i % 4],
-            "ATTR-005": ["普通", "银卡", "金卡", "钻石"][i % 4],
-            "value": float(i * 10.5),
-        })
-    return events
+from app.services.event_data import read_cleansed_events
+from app.services.event_cleanse import find_cleanse_receipt
 
 
 def aggregate_events(config_id: str) -> AggResult:
@@ -38,16 +26,11 @@ def aggregate_events(config_id: str) -> AggResult:
     time_grain = config["time_grain"]
     filter_expr = config.get("filter_expr", "")
 
-    # 获取清洗产物作为输入
-    cleanse_artifacts = store.list_artifacts("event_cleanse")
-    related_cleanse = None
-    for ca in cleanse_artifacts:
-        if ca.get("event_id") == event_id:
-            related_cleanse = ca
-            break
+    # 读取清洗回执：聚合批次须能回溯到产生输入数据的清洗批次
+    cleanse_receipt = find_cleanse_receipt(event_id)
 
     # 生成事件数据
-    events = _generate_cleaned_events(event_id, 1000)
+    events = read_cleansed_events(event_id, 1000)
 
     # 应用过滤
     if filter_expr:
@@ -110,6 +93,7 @@ def aggregate_events(config_id: str) -> AggResult:
         result_rows=result_rows,
         total_count=len(result_rows),
         output_table=config.get("output_table", ""),
+        cleanse_receipt=cleanse_receipt or {},
     )
 
     # 存储产物

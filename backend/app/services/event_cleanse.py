@@ -1,47 +1,50 @@
-"""事件清洗引擎：校验事件数据，执行去重和异常处理。"""
+"""事件清洗引擎：校验事件数据，执行去重和异常处理。
+
+字段校验与刷量检测是两个独立阶段，各自按规则配置对异常事件
+执行隔离（quarantine）、丢弃（discard）或标记（flag）。
+"""
 from __future__ import annotations
 
 from typing import Any
-from collections import defaultdict
 
 from app.store import store
 from app.schemas import CleanseResult
+from app.services.event_data import read_raw_events
 
 
-def _generate_raw_event_data(event_id: str, count: int) -> list[dict[str, Any]]:
-    """生成原始事件数据用于清洗。"""
-    events = []
-    base_time = 1700000000
-    for i in range(1, count + 1):
-        user_id = f"U{i:05d}"
-        # 模拟部分异常数据
-        is_bot = i % 20 == 0
-        is_dup = i % 15 == 0
-        is_invalid = i % 25 == 0
+def _apply_anomaly_action(evt: dict[str, Any], action: str) -> bool:
+    """对异常事件应用处理动作：隔离 / 丢弃 / 标记。返回是否丢弃该事件。"""
+    if action == "discard":
+        return True
+    if action == "quarantine":
+        evt["quarantined"] = True
+    else:  # flag
+        evt["flagged"] = True
+    return False
 
-        events.append({
-            "user_id": user_id,
-            "event_id": event_id,
-            "timestamp": base_time + i * 60,
-            "page_url": "" if is_invalid else f"/page{i % 10}",
-            "item_id": -1 if is_invalid else i,
-            "amount": -10.0 if is_invalid else float(i * 5.5),
-            "is_bot": is_bot,
-            "is_dup": is_dup,
-        })
-        if is_dup:
-            # 插入重复数据
-            events.append({
-                "user_id": user_id,
-                "event_id": event_id,
-                "timestamp": base_time + i * 60,
-                "page_url": f"/page{i % 10}",
-                "item_id": i,
-                "amount": float(i * 5.5),
-                "is_bot": False,
-                "is_dup": True,
-            })
-    return events
+
+def _check_field_valid(evt: dict[str, Any], check_fields: list[str], valid_range: dict[str, Any]) -> bool:
+    """字段校验：必填缺失或超出合法范围视为不合法。"""
+    for field in check_fields:
+        val = evt.get(field)
+        if val is None or val == "":
+            return False
+        # 范围校验
+        if field in valid_range:
+            range_cfg = valid_range[field]
+            if "min" in range_cfg:
+                try:
+                    if float(val) < float(range_cfg["min"]):
+                        return False
+                except (ValueError, TypeError):
+                    pass
+            if "max" in range_cfg:
+                try:
+                    if float(val) > float(range_cfg["max"]):
+                        return False
+                except (ValueError, TypeError):
+                    pass
+    return True
 
 
 def cleanse_events(rule_id: str) -> CleanseResult:
@@ -53,12 +56,14 @@ def cleanse_events(rule_id: str) -> CleanseResult:
     event_id = rule["event_id"]
     check_fields = rule.get("check_fields", [])
     valid_range = rule.get("valid_range", {})
-    anomaly_action = rule["anomaly_action"]
+    # 字段校验与刷量检测分别处理异常：刷量动作可独立配置，缺省沿用字段校验动作
+    field_action = rule["anomaly_action"]
+    bot_action = rule.get("bot_action") or field_action
     bot_detect = rule.get("bot_detect", False)
     dedup_window = rule.get("dedup_window", 0)
 
     # 获取原始事件数据
-    events = _generate_raw_event_data(event_id, 500)
+    events = read_raw_events(event_id, 500)
 
     total_records = len(events)
     valid_records = 0
@@ -70,49 +75,17 @@ def cleanse_events(rule_id: str) -> CleanseResult:
     cleansed: list[dict[str, Any]] = []
 
     for evt in events:
-        # 刷量检测
+        # 刷量检测：独立应用隔离 / 丢弃 / 标记
         if bot_detect and evt.get("is_bot"):
             invalid_records += 1
-            if anomaly_action == "discard":
+            if _apply_anomaly_action(evt, bot_action):
                 continue
-            elif anomaly_action == "quarantine":
-                evt["quarantined"] = True
-            else:  # flag
-                evt["flagged"] = True
 
-        # 字段校验
-        is_invalid = False
-        for field in check_fields:
-            val = evt.get(field)
-            if val is None or val == "":
-                is_invalid = True
-                break
-            # 范围校验
-            if field in valid_range:
-                range_cfg = valid_range[field]
-                if "min" in range_cfg:
-                    try:
-                        if float(val) < float(range_cfg["min"]):
-                            is_invalid = True
-                            break
-                    except (ValueError, TypeError):
-                        pass
-                if "max" in range_cfg:
-                    try:
-                        if float(val) > float(range_cfg["max"]):
-                            is_invalid = True
-                            break
-                    except (ValueError, TypeError):
-                        pass
-
-        if is_invalid:
+        # 字段校验：独立应用隔离 / 丢弃 / 标记
+        if not _check_field_valid(evt, check_fields, valid_range):
             invalid_records += 1
-            if anomaly_action == "discard":
+            if _apply_anomaly_action(evt, field_action):
                 continue
-            elif anomaly_action == "quarantine":
-                evt["quarantined"] = True
-            else:
-                evt["flagged"] = True
 
         # 去重
         if dedup_window > 0:
@@ -136,7 +109,7 @@ def cleanse_events(rule_id: str) -> CleanseResult:
         snapshot_path=f"/data/cleansed/{rule_id}.parquet",
     )
 
-    # 存储产物
+    # 存储产物（清洗回执，供事件聚合读取）
     store.set_artifact("event_cleanse", rule_id, result.model_dump())
 
     # 更新状态
@@ -149,7 +122,7 @@ def cleanse_events(rule_id: str) -> CleanseResult:
 
 
 def get_cleanse_result(rule_id: str) -> dict[str, Any] | None:
-    """获取清洗结果。"""
+    """获取清洗结果（清洗回执）。"""
     artifact = store.get_artifact("event_cleanse", rule_id)
     if artifact:
         return artifact
@@ -158,3 +131,11 @@ def get_cleanse_result(rule_id: str) -> dict[str, Any] | None:
         return result.model_dump()
     except ValueError:
         return None
+
+
+def find_cleanse_receipt(event_id: str) -> dict[str, Any] | None:
+    """按事件编号查找已确认的清洗回执。"""
+    for artifact in store.list_artifacts("event_cleanse"):
+        if artifact.get("event_id") == event_id:
+            return artifact
+    return None

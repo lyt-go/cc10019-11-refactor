@@ -385,6 +385,7 @@ class AggResult(BaseModel):
     result_rows: list[dict[str, Any]] = Field(default_factory=list)
     total_count: int = 0
     output_table: str = ""
+    cleanse_receipt: dict[str, Any] = Field(default_factory=dict, description="聚合批次读取的清洗回执")
 
 
 class TagComputeResult(BaseModel):
